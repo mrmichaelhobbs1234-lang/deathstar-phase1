@@ -1,4 +1,11 @@
+import { z } from "zod";
 import { handleChatMessage, type Env } from "./chat";
+import {
+  enforceAiQuota,
+  enforceNonceWindow,
+  enforceRateLimit
+} from "./guards";
+import { appendLedgerEntry } from "./ledger";
 
 const CHAT_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -240,6 +247,16 @@ const CHAT_HTML = `<!DOCTYPE html>
   </body>
 </html>`;
 
+const LedgerAppendSchema = z.object({
+  ledgerid: z.string().min(1).max(100),
+  blockid: z.string().regex(/^[A-Z0-9-]+$/),
+  nonce: z.number().int().positive()
+});
+
+const AiTestSchema = z.object({
+  prompt: z.string().min(1).max(1000)
+});
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -254,6 +271,71 @@ export default {
     // Chat message endpoint
     if (url.pathname === "/chat/message" && request.method === "POST") {
       return handleChatMessage(request, env);
+    }
+
+    if (url.pathname === "/ledgerappend" && request.method === "POST") {
+      const rateLimit = await enforceRateLimit(env);
+      if (rateLimit) {
+        return rateLimit;
+      }
+
+      let payload: unknown;
+      try {
+        payload = await request.json();
+      } catch (error) {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+
+      const parsed = LedgerAppendSchema.safeParse(payload);
+      if (!parsed.success) {
+        return new Response("Invalid payload", { status: 400 });
+      }
+
+      const nonceWindow = enforceNonceWindow(parsed.data.nonce);
+      if (nonceWindow) {
+        return nonceWindow;
+      }
+
+      const ledgerError = await appendLedgerEntry(env, parsed.data);
+      if (ledgerError) {
+        return ledgerError;
+      }
+
+      return Response.json({ ok: true });
+    }
+
+    if (url.pathname === "/aitest" && request.method === "POST") {
+      const rateLimit = await enforceRateLimit(env);
+      if (rateLimit) {
+        return rateLimit;
+      }
+
+      let payload: unknown;
+      try {
+        payload = await request.json();
+      } catch (error) {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+
+      const parsed = AiTestSchema.safeParse(payload);
+      if (!parsed.success) {
+        return new Response("Invalid payload", { status: 400 });
+      }
+
+      const quota = await enforceAiQuota(env);
+      if (quota) {
+        return quota;
+      }
+
+      if (!env.AI || typeof env.AI.run !== "function") {
+        return new Response("AI unavailable", { status: 500 });
+      }
+
+      const result = await env.AI.run("@cf/meta/llama-2-7b-chat-int8", {
+        prompt: parsed.data.prompt
+      });
+
+      return Response.json({ ok: true, result });
     }
 
     return new Response("Not Found", { status: 404 });
